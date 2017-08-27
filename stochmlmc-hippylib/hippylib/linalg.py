@@ -1,0 +1,258 @@
+# Copyright (c) 2016, The University of Texas at Austin & University of
+# California, Merced.
+#
+# All Rights reserved.
+# See file COPYRIGHT for details.
+#
+# This file is part of the hIPPYlib library. For more information and source code
+# availability see https://hippylib.github.io.
+#
+# hIPPYlib is free software; you can redistribute it and/or modify it under the
+# terms of the GNU General Public License (as published by the Free
+# Software Foundation) version 2.0 dated June 1991.
+
+from dolfin import compile_extension_module, Vector, PETScKrylovSolver, MPI, la_index_dtype
+from random import parRandom
+import os
+import numpy as np
+
+def amg_method():
+    """
+    Determine which AMG preconditioner to use.
+    If avaialable use ML, which is faster than the PETSc one.
+    """
+    S = PETScKrylovSolver()
+    for pp in S.preconditioners():
+        if pp[0] == 'ml_amg':
+            return 'ml_amg'
+        
+    return 'petsc_amg'
+
+abspath = os.path.dirname( os.path.abspath(__file__) )
+source_directory = os.path.join(abspath,"cpp_linalg")
+header_file = open(os.path.join(source_directory,"linalg.h"), "r")
+code = header_file.read()
+header_file.close()
+cpp_sources = ["linalg.cpp"]  
+
+include_dirs = [".", source_directory]
+for ss in ['PROFILE_INSTALL_DIR', 'PETSC_DIR', 'SLEPC_DIR']:
+    if os.environ.has_key(ss):
+        include_dirs.append(os.environ[ss]+'/include')
+        
+cpp_module = compile_extension_module(
+                code=code, source_directory=source_directory,
+                sources=cpp_sources, include_dirs=include_dirs)
+
+def MatMatMult(A,B):
+    """
+    Compute the matrix-matrix product A*B.
+    """
+    s = cpp_module.cpp_linalg()
+    return s.MatMatMult(A,B)
+
+def MatPtAP(A,P):
+    """
+    Compute the triple matrix product P^T*A*P.
+    """
+    s = cpp_module.cpp_linalg()
+    return s.MatPtAP(A,P)
+
+def MatAtB(A,B):
+    """
+    Compute the matrix-matrix product A^T*B.
+    """
+    s = cpp_module.cpp_linalg()
+    return s.MatAtB(A,B)
+
+def Transpose(A):
+    """
+    Compute the matrix transpose
+    """
+    s = cpp_module.cpp_linalg()
+    return s.Transpose(A)
+
+def SetToOwnedGid(v, gid, val):
+    s = cpp_module.cpp_linalg()
+    s.SetToOwnedGid(v, gid, val)
+    
+def GetFromOwnedGid(v, gid):
+    s = cpp_module.cpp_linalg()
+    return s.GetFromOwnedGid(v, gid)
+    
+
+def to_dense(A):
+    """
+    Convert a sparse matrix A to dense.
+    For debugging only.
+    """
+    v = Vector()
+    A.init_vector(v)
+    mpi_comm = v.mpi_comm()
+    nprocs = MPI.size(mpi_comm)
+    
+    if nprocs > 1:
+        raise Exception("to_dense is only serial")
+    
+    if hasattr(A, "getrow"):
+        n  = A.size(0)
+        m  = A.size(1)
+        B = np.zeros( (n,m), dtype=np.float64)
+        for i in range(0,n):
+            [j, val] = A.getrow(i)
+            B[i,j] = val
+        
+        return B
+    else:
+        x = Vector()
+        Ax = Vector()
+        A.init_vector(x,1)
+        A.init_vector(Ax,0)
+        
+        n = Ax.array().shape[0]
+        m = x.array().shape[0]
+        B = np.zeros( (n,m), dtype=np.float64) 
+        for i in range(0,m):
+            i_ind = np.array([i], dtype=np.intc)
+            x.set_local(np.ones(i_ind.shape), i_ind)
+            x.apply("sum_values")
+            A.mult(x,Ax)
+            B[:,i] = Ax.array()
+            x.set_local(np.zeros(i_ind.shape), i_ind)
+            x.apply("sum_values")
+            
+        return B
+
+
+def trace(A):
+    """
+    Compute the trace of a sparse matrix A.
+    """
+    v = Vector()
+    A.init_vector(v)
+    mpi_comm = v.mpi_comm()
+    nprocs = MPI.size(mpi_comm)
+    
+    if nprocs > 1:
+        raise Exception("trace is only serial")
+    
+    n  = A.size(0)
+    tr = 0.
+    for i in range(0,n):
+        [j, val] = A.getrow(i)
+        tr += val[j == i]
+    return tr
+
+def get_diagonal(A, d):
+    """
+    Compute the diagonal of the square operator A.
+    Use Solver2Operator if A^-1 is needed.
+    """
+    ej, xj = Vector(), Vector()
+    A.init_vector(ej,1)
+    A.init_vector(xj,0)
+                    
+    g_size = ej.size()    
+    d.zero()
+    for gid in xrange(g_size):
+        owns_gid = ej.owns_index(gid)
+        if owns_gid:
+            SetToOwnedGid(ej, gid, 1.)
+        ej.apply("insert")
+        A.mult(ej,xj)
+        if owns_gid:
+            val = GetFromOwnedGid(xj, gid)
+            SetToOwnedGid(d, gid, val)
+            SetToOwnedGid(ej, gid, 0.)
+        ej.apply("insert")
+        
+    d.apply("insert")
+
+    
+
+def estimate_diagonal_inv2(Asolver, k, d):
+    """
+    An unbiased stochastic estimator for the diagonal of A^-1.
+    d = [ \sum_{j=1}^k vj .* A^{-1} vj ] ./ [ \sum_{j=1}^k vj .* vj ]
+    where
+    - vj are i.i.d. ~ N(0, I)
+    - .* and ./ represent the element-wise multiplication and division
+      of vectors, respectively.
+      
+    REFERENCE:
+    Costas Bekas, Effrosyni Kokiopoulou, and Yousef Saad,
+    An estimator for the diagonal of a matrix,
+    Applied Numerical Mathematics, 57 (2007), pp. 1214-1229.
+    """
+    x, b = Vector(), Vector()
+    
+    if hasattr(Asolver, "init_vector"):
+        Asolver.init_vector(x,1)
+        Asolver.init_vector(b,0)
+    else:       
+        Asolver.get_operator().init_vector(x,1)
+        Asolver.get_operator().init_vector(b,0)
+        
+    d.zero()
+    for i in range(k):
+        x.zero()
+        parRandom.normal(1., b)
+        Asolver.solve(x,b)
+        x *= b
+        d.axpy(1./float(k), x)
+        
+class DiagonalOperator:
+    def __init__(self, d):
+        self.d = d
+        
+    def init_vector(self,x,dim):
+        x.init(self.d.local_range())
+        
+    def mult(self,x,y):
+        tmp = self.d*x
+        y.zero()
+        y.axpy(1., x)
+        
+    def inner(self,x,y):
+        tmp = self.d*y
+        return x.inner(tmp)
+    
+class Solver2Operator:
+    def __init__(self,S):
+        self.S = S
+        self.tmp = Vector()
+        
+    def init_vector(self, x, dim):
+        if hasattr(self.S, "init_vector"):
+            self.S.init_vector(x,dim)
+        elif hasattr(self.S, "operator"):
+            self.S.operator().init_vector(x,dim)
+        elif hasattr(self.S, "get_operator"):
+            self.S.get_operator().init_vector(x,dim)
+        else:
+            raise
+        
+    def mult(self,x,y):
+        self.S.solve(y,x)
+        
+    def inner(self, x, y):
+        self.S.solve(self.tmp,y)
+        return self.tmp.inner(x)
+    
+class Operator2Solver:
+    def __init__(self,op):
+        self.op = op
+        self.tmp = Vector()
+        
+    def init_vector(self, x, dim):
+        if hasattr(self.op, "init_vector"):
+            self.op.init_vector(x,dim)
+        else:
+            raise
+        
+    def solve(self,y,x):
+        self.op.mult(x,y)
+        
+    def inner(self, x, y):
+        self.op.mult(y,self.tmp)
+        return self.tmp.inner(x)

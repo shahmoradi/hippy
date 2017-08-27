@@ -1,0 +1,15 @@
+image: quay.io/fenicsproject/stable:2017.1.0
+
+pipelines:
+  branches:
+    master:
+    - step:
+        script: 
+          - cd /home/fenics
+          - ln -s /opt/atlassian/pipelines/agent/build hippylib
+          - cd hippylib/applications/poisson
+          - mpirun -n 4 python model_subsurf.py
+          - mpirun -n 4 python model_pointwise_obs.py
+          - cd ../ad_diff
+          - mpirun -n 1 python model_ad_diff.py
+
